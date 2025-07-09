@@ -3,9 +3,7 @@ import { View, Text, Button, StyleSheet, ActivityIndicator, ScrollView } from 'r
 import { Audio } from 'expo-av';
 import axios from 'axios';
 import * as FileSystem from 'expo-file-system';
-import { Asset } from 'expo-asset';
-import { lyrics as lyricsData } from './lyricsData';
-import { AUDD_API_KEY } from '@env';
+import { AUDD_API_KEY, API_SERVER_URL } from '@env';
 
 export default function App() {
   const [song, setSong] = useState(null);
@@ -17,7 +15,6 @@ export default function App() {
   const [isLyricsDirectoryReady, setIsLyricsDirectoryReady] = useState(false);
   const [currentLyricIndex, setCurrentLyricIndex] = useState(-1);
   const [lyricTimer, setLyricTimer] = useState(null);
-  const [songStartTime, setSongStartTime] = useState(null);
   const [currentTimecode, setCurrentTimecode] = useState(null);
   const scrollViewRef = useRef(null);
   const RECORDING_DURATION = 8000; // 8 seconds of listening time
@@ -127,7 +124,7 @@ export default function App() {
     }
   };
 
-  // Update the loadLocalLyrics function to use hard-coded matching
+  // Update the loadLocalLyrics function to use syncedlyrics for dynamic fetching
   const loadLocalLyrics = async (searchQuery) => {
     try {
       if (!isLyricsDirectoryReady) {
@@ -135,82 +132,84 @@ export default function App() {
         await setupLyricsDirectory();
       }
       
-      // Hard-coded matching for specific songs
-      let matchedFile = null;
+      console.log('Fetching lyrics dynamically for:', searchQuery);
       
-      // Convert search query to lowercase for case-insensitive matching
-      const lowerSearchQuery = searchQuery.toLowerCase();
+      // Check if we have already cached this query
+      const resultsDir = `${FileSystem.documentDirectory}results/`;
+      const safeFileName = `${searchQuery.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.lrc`;
+      const cachedLyricsPath = `${resultsDir}${safeFileName}`;
       
-      // Hard-coded matches for some popular songs"
-      if (lowerSearchQuery.includes('sky') && lowerSearchQuery.includes('stars') && 
-          (lowerSearchQuery.includes('coldplay') || lowerSearchQuery.includes('full'))) {
-        matchedFile = "sky full of stars.lrc";
-        console.log('Hard-coded match found for Sky Full of Stars');
-      }
-      // Add more hard-coded matches as needed
-      else if (lowerSearchQuery.includes('shape') && lowerSearchQuery.includes('you') &&
-               lowerSearchQuery.includes('of')) {
-        matchedFile = "shape of you - ed sheeran.lrc";
-        console.log('Hard-coded match found for Shape of You');
-      }
-      else if (lowerSearchQuery.includes('uptown') && lowerSearchQuery.includes('funk')) {
-        matchedFile = "uptown funk - bruno mars.lrc";
-        console.log('Hard-coded match found for Uptown Funk');
-      }
-      // Add additional matches here as needed
-      
-      // If we found a hard-coded match, use it
-      if (matchedFile) {
-        console.log(`Using hard-coded match: ${matchedFile}`);
+      try {
+        // Check if we already have cached lyrics
+        const cachedFileInfo = await FileSystem.getInfoAsync(cachedLyricsPath);
         
-        const resultsDir = `${FileSystem.documentDirectory}results/`;
+        if (cachedFileInfo.exists) {
+          console.log('Using cached lyrics file:', safeFileName);
+          const cachedContents = await FileSystem.readAsStringAsync(cachedLyricsPath);
+          processAndDisplayLyrics(cachedContents);
+          return;
+        }
         
-        // Read the lyrics file
-        try {
-          const fileContents = await FileSystem.readAsStringAsync(resultsDir + matchedFile);
+        // Fetch from the syncedlyrics API server
+        console.log('No cached lyrics found, fetching from API...');
+        const response = await axios.post(`${API_SERVER_URL}/fetch-lyrics`, {
+          searchQuery
+        });
+        
+        if (response.data.error) {
+          console.error('API error:', response.data.error);
+          setLyrics([{ words: `No lyrics found for: ${searchQuery}` }]);
+          setIsDisplayingLyrics(true);
+          return;
+        }
+        
+        if (response.data.lyrics) {
+          // Save the fetched lyrics to cache
+          await FileSystem.writeAsStringAsync(cachedLyricsPath, response.data.lyrics);
+          console.log(`Saved new lyrics file: ${safeFileName}`);
           
-          // Process timestamped lyrics (LRC format)
-          const timestampedLyrics = fileContents
-            .split('\n')
-            .filter(line => line.trim())
-            .map(line => {
-              // Extract timestamp if available
-              const timestampMatch = line.match(/^\[(\d{2}:\d{2}(?:[:.]\d+)?)\]/);
-              const timestamp = timestampMatch ? timestampMatch[1] : null;
-              const text = timestampMatch ? line.substring(timestampMatch[0].length).trim() : line.trim();
-              
-              return {
-                words: text,
-                timestamp: timestamp
-              };
-            });
-          
-          if (timestampedLyrics.length > 0) {
-            setLyrics(timestampedLyrics);
-            setIsDisplayingLyrics(true);
-            
-            // If we have an active song with timecode, start lyrics display
-            // if (song?.timecode) {
-            //   const timecodeSeconds = timeToSeconds(song.timecode);
-            //   startLyricsDisplay(timecodeSeconds);
-            // }
-          } else {
-            setLyrics([{ words: "No lyrics content found in file" }]);
-            setIsDisplayingLyrics(true);
-          }
-        } catch (err) {
-          console.error(`Error reading lyrics file ${matchedFile}:`, err);
-          setLyrics([{ words: `Error reading lyrics for: ${matchedFile}` }]);
+          // Process and display the lyrics
+          processAndDisplayLyrics(response.data.lyrics);
+        } else {
+          setLyrics([{ words: `No lyrics found for: ${searchQuery}` }]);
           setIsDisplayingLyrics(true);
         }
-      } else {
-        console.log('No hard-coded match found for:', searchQuery);
-        setLyrics([{ words: `No lyrics available for: ${searchQuery}` }]);
+        
+      } catch (err) {
+        console.error('Error fetching lyrics from API:', err);
+        setLyrics([{ words: `Error fetching lyrics for: ${searchQuery}` }]);
         setIsDisplayingLyrics(true);
       }
     } catch (err) {
       console.error('Error in loadLocalLyrics:', err);
       setLyrics([{ words: "Error loading lyrics" }]);
+      setIsDisplayingLyrics(true);
+    }
+  };
+
+  // Helper function to process and display lyrics
+  const processAndDisplayLyrics = (lyricsContent) => {
+    // Process timestamped lyrics (LRC format)
+    const timestampedLyrics = lyricsContent
+      .split('\n')
+      .filter(line => line.trim())
+      .map(line => {
+        // Extract timestamp if available
+        const timestampMatch = line.match(/^\[(\d{2}:\d{2}(?:[:.]\d+)?)\]/);
+        const timestamp = timestampMatch ? timestampMatch[1] : null;
+        const text = timestampMatch ? line.substring(timestampMatch[0].length).trim() : line.trim();
+        
+        return {
+          words: text,
+          timestamp: timestamp
+        };
+      });
+    
+    if (timestampedLyrics.length > 0) {
+      setLyrics(timestampedLyrics);
+      setIsDisplayingLyrics(true);
+    } else {
+      setLyrics([{ words: "No lyrics content found" }]);
       setIsDisplayingLyrics(true);
     }
   };
@@ -229,37 +228,8 @@ export default function App() {
         console.log("Creating results directory...");
         await FileSystem.makeDirectoryAsync(resultsDir, { intermediates: true });
       }
-
-      // Check if we've already copied the lyrics files
-      const marker = await FileSystem.getInfoAsync(`${resultsDir}/.copied`);
       
-      // Force re-copy for testing purposes
-      if (marker.exists) {
-        console.log("Removing old copy marker for fresh copy");
-        await FileSystem.deleteAsync(`${resultsDir}/.copied`);
-      }
-      
-      if (!marker.exists) {
-        console.log("Copying lyrics files to app storage...");
-        
-        console.log('Lyrics data keys:', Object.keys(lyricsData));
-        
-        // Write each lyrics file to the app's document directory
-        for (const [fileName, content] of Object.entries(lyricsData)) {
-          await FileSystem.writeAsStringAsync(`${resultsDir}${fileName}`, content);
-          console.log(`Copied: ${fileName}`);
-        }
-        
-        // Create a marker file AFTER successful copying
-        await FileSystem.writeAsStringAsync(
-          `${resultsDir}/.copied`, 
-          "Lyrics files copied"
-        );
-        
-        console.log("All lyrics files copied to app storage");
-      }
-      
-      // List the files in the directory to verify
+      // List files in directory
       const files = await FileSystem.readDirectoryAsync(resultsDir);
       console.log('Files in results directory:', files);
       
