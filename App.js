@@ -1,16 +1,24 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { View, Text, Button, StyleSheet, ActivityIndicator, ScrollView } from 'react-native';
 import { Audio } from 'expo-av';
 import axios from 'axios';
+import * as FileSystem from 'expo-file-system';
+import { Asset } from 'expo-asset';
+import { lyrics as lyricsData } from './lyricsData';
+import { AUDD_API_KEY } from '@env';
 
 export default function App() {
-  // State declarations
   const [song, setSong] = useState(null);
   const [recording, setRecording] = useState(null);
   const [isListening, setIsListening] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [lyrics, setLyrics] = useState([]);
   const [isDisplayingLyrics, setIsDisplayingLyrics] = useState(false);
+  const [isLyricsDirectoryReady, setIsLyricsDirectoryReady] = useState(false);
+  const [currentLyricIndex, setCurrentLyricIndex] = useState(-1);
+  const [lyricTimer, setLyricTimer] = useState(null);
+  const [songStartTime, setSongStartTime] = useState(null);
+  const [currentTimecode, setCurrentTimecode] = useState(null);
   const scrollViewRef = useRef(null);
   const RECORDING_DURATION = 8000; // 8 seconds of listening time
 
@@ -68,91 +76,35 @@ export default function App() {
         name: 'recording.wav',
         type: 'audio/wav',
       });
-      formData.append('api_token', 'db83e37309682c59b1f5dca72111a3d6');
-      formData.append('return', 'timecode,apple_music,spotify,deezer,napster,lyrics');
+      formData.append('api_token', AUDD_API_KEY);
+      formData.append('return', 'timecode,apple_music,spotify');
 
       const response = await axios.post('https://api.audd.io/', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
-      console.log('API Response:', response.data);
-      console.log('lyrics:', response.data.result?.lyrics);
-      console.log('Lyrics type:', typeof response.data.result.lyrics);
-      console.log('Timecode:', response.data.result?.timecode);
-
-      // Process API response
+      
       if (response.data?.result) {
         setSong(response.data.result);
         
-        // Process lyrics if available - handle both string and object types
-        if (response.data.result.lyrics) {
-          let processedLyrics = [];
+        // Generate search query from song info
+        const title = response.data.result.title || '';
+        const artist = response.data.result.artist || '';
+        const searchQuery = `${title} ${artist}`.trim().toLowerCase();
+        
+        console.log('Search query for local lyrics:', searchQuery);
+        
+        // Try to find and load local lyrics file
+        try {
+          await loadLocalLyrics(searchQuery);
           
-          if (typeof response.data.result.lyrics === 'string') {
-            // Handle string lyrics
-            processedLyrics = response.data.result.lyrics
-              .split('\n')
-              .filter(line => line.trim() !== '')
-              .map(line => ({ words: line }));
-          } 
-          else if (typeof response.data.result.lyrics === 'object') {
-            // Handle object lyrics - extract the text content
-            console.log('Lyrics is an object:', response.data.result.lyrics);
-            
-            // Check if it has a text property (common format)
-            if (response.data.result.lyrics.text) {
-              processedLyrics = response.data.result.lyrics.text
-                .split('\n')
-                .filter(line => line.trim() !== '')
-                .map(line => ({ words: line }));
-            }
-            // Check for trackingURL which might contain lyrics info
-            else if (response.data.result.lyrics.trackingURL) {
-              processedLyrics = [{ words: "Lyrics available via: " + response.data.result.lyrics.trackingURL }];
-            }
-            // Look for any string properties that might contain lyrics
-            else {
-              // Try to find any string properties that might be lyrics
-              const potentialLyricKeys = Object.keys(response.data.result.lyrics).filter(key => 
-                typeof response.data.result.lyrics[key] === 'string' && 
-                response.data.result.lyrics[key].length > 50
-              );
-              
-              if (potentialLyricKeys.length > 0) {
-                // Use the longest string as lyrics
-                const bestKey = potentialLyricKeys.reduce((a, b) => 
-                  response.data.result.lyrics[a].length > response.data.result.lyrics[b].length ? a : b
-                );
-                
-                processedLyrics = response.data.result.lyrics[bestKey]
-                  .split('\n')
-                  .filter(line => line.trim() !== '')
-                  .map(line => ({ words: line }));
-              }
-              // Format as readable key-value pairs if no suitable lyrics text is found
-              else {
-                processedLyrics = Object.entries(response.data.result.lyrics)
-                  .filter(([key, value]) => value !== null && value !== undefined && key !== 'instrumental')
-                  .map(([key, value]) => {
-                    const formattedValue = typeof value === 'object' 
-                      ? '[Object]' 
-                      : String(value).substring(0, 100);
-                    return { words: `${key}: ${formattedValue}` };
-                  });
-                
-                // Add a header to explain what this is
-                processedLyrics.unshift({ words: "Lyrics metadata:" });
-              }
-            }
+          // Start dynamic lyrics display with the timecode from the API
+          if (response.data.result.timecode) {
+            const timecodeSeconds = timeToSeconds(response.data.result.timecode);
+            console.log(`Starting lyrics display at time position: ${timecodeSeconds}s`);
+            startLyricsDisplay(timecodeSeconds);
           }
-          
-          if (processedLyrics.length > 0) {
-            setLyrics(processedLyrics);
-            setIsDisplayingLyrics(true);
-          } else {
-            setLyrics([]);
-            setIsDisplayingLyrics(false);
-          }
-        } else {
+        } catch (err) {
+          console.error('Error loading local lyrics:', err);
           setLyrics([]);
           setIsDisplayingLyrics(false);
         }
@@ -175,7 +127,270 @@ export default function App() {
     }
   };
 
-  // Update the renderLyrics function
+  // Update the loadLocalLyrics function to use hard-coded matching
+  const loadLocalLyrics = async (searchQuery) => {
+    try {
+      if (!isLyricsDirectoryReady) {
+        console.log('Lyrics directory not ready yet');
+        await setupLyricsDirectory();
+      }
+      
+      // Hard-coded matching for specific songs
+      let matchedFile = null;
+      
+      // Convert search query to lowercase for case-insensitive matching
+      const lowerSearchQuery = searchQuery.toLowerCase();
+      
+      // Hard-coded matches for some popular songs"
+      if (lowerSearchQuery.includes('sky') && lowerSearchQuery.includes('stars') && 
+          (lowerSearchQuery.includes('coldplay') || lowerSearchQuery.includes('full'))) {
+        matchedFile = "sky full of stars.lrc";
+        console.log('Hard-coded match found for Sky Full of Stars');
+      }
+      // Add more hard-coded matches as needed
+      else if (lowerSearchQuery.includes('shape') && lowerSearchQuery.includes('you') &&
+               lowerSearchQuery.includes('of')) {
+        matchedFile = "shape of you - ed sheeran.lrc";
+        console.log('Hard-coded match found for Shape of You');
+      }
+      else if (lowerSearchQuery.includes('uptown') && lowerSearchQuery.includes('funk')) {
+        matchedFile = "uptown funk - bruno mars.lrc";
+        console.log('Hard-coded match found for Uptown Funk');
+      }
+      // Add additional matches here as needed
+      
+      // If we found a hard-coded match, use it
+      if (matchedFile) {
+        console.log(`Using hard-coded match: ${matchedFile}`);
+        
+        const resultsDir = `${FileSystem.documentDirectory}results/`;
+        
+        // Read the lyrics file
+        try {
+          const fileContents = await FileSystem.readAsStringAsync(resultsDir + matchedFile);
+          
+          // Process timestamped lyrics (LRC format)
+          const timestampedLyrics = fileContents
+            .split('\n')
+            .filter(line => line.trim())
+            .map(line => {
+              // Extract timestamp if available
+              const timestampMatch = line.match(/^\[(\d{2}:\d{2}(?:[:.]\d+)?)\]/);
+              const timestamp = timestampMatch ? timestampMatch[1] : null;
+              const text = timestampMatch ? line.substring(timestampMatch[0].length).trim() : line.trim();
+              
+              return {
+                words: text,
+                timestamp: timestamp
+              };
+            });
+          
+          if (timestampedLyrics.length > 0) {
+            setLyrics(timestampedLyrics);
+            setIsDisplayingLyrics(true);
+            
+            // If we have an active song with timecode, start lyrics display
+            // if (song?.timecode) {
+            //   const timecodeSeconds = timeToSeconds(song.timecode);
+            //   startLyricsDisplay(timecodeSeconds);
+            // }
+          } else {
+            setLyrics([{ words: "No lyrics content found in file" }]);
+            setIsDisplayingLyrics(true);
+          }
+        } catch (err) {
+          console.error(`Error reading lyrics file ${matchedFile}:`, err);
+          setLyrics([{ words: `Error reading lyrics for: ${matchedFile}` }]);
+          setIsDisplayingLyrics(true);
+        }
+      } else {
+        console.log('No hard-coded match found for:', searchQuery);
+        setLyrics([{ words: `No lyrics available for: ${searchQuery}` }]);
+        setIsDisplayingLyrics(true);
+      }
+    } catch (err) {
+      console.error('Error in loadLocalLyrics:', err);
+      setLyrics([{ words: "Error loading lyrics" }]);
+      setIsDisplayingLyrics(true);
+    }
+  };
+
+  // Setup lyrics directory on app startup
+  useEffect(() => {
+    setupLyricsDirectory();
+  }, []);
+
+  const setupLyricsDirectory = async () => {
+    try {
+      const resultsDir = `${FileSystem.documentDirectory}results/`;
+      const dirInfo = await FileSystem.getInfoAsync(resultsDir);
+      
+      if (!dirInfo.exists) {
+        console.log("Creating results directory...");
+        await FileSystem.makeDirectoryAsync(resultsDir, { intermediates: true });
+      }
+
+      // Check if we've already copied the lyrics files
+      const marker = await FileSystem.getInfoAsync(`${resultsDir}/.copied`);
+      
+      // Force re-copy for testing purposes
+      if (marker.exists) {
+        console.log("Removing old copy marker for fresh copy");
+        await FileSystem.deleteAsync(`${resultsDir}/.copied`);
+      }
+      
+      if (!marker.exists) {
+        console.log("Copying lyrics files to app storage...");
+        
+        console.log('Lyrics data keys:', Object.keys(lyricsData));
+        
+        // Write each lyrics file to the app's document directory
+        for (const [fileName, content] of Object.entries(lyricsData)) {
+          await FileSystem.writeAsStringAsync(`${resultsDir}${fileName}`, content);
+          console.log(`Copied: ${fileName}`);
+        }
+        
+        // Create a marker file AFTER successful copying
+        await FileSystem.writeAsStringAsync(
+          `${resultsDir}/.copied`, 
+          "Lyrics files copied"
+        );
+        
+        console.log("All lyrics files copied to app storage");
+      }
+      
+      // List the files in the directory to verify
+      const files = await FileSystem.readDirectoryAsync(resultsDir);
+      console.log('Files in results directory:', files);
+      
+      setIsLyricsDirectoryReady(true);
+    } catch (error) {
+      console.error("Error setting up lyrics directory:", error);
+    }
+  };
+
+  // Convert timecode to seconds
+  const timeToSeconds = (timeString) => {
+    if (!timeString) return 0;
+    const parts = timeString.split(':');
+    if (parts.length === 2) {
+      // Format: MM:SS
+      return parseInt(parts[0]) * 60 + parseFloat(parts[1]);
+    } else if (parts.length === 3) {
+      // Format: HH:MM:SS
+      return parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseFloat(parts[2]);
+    }
+    return 0;
+  };
+
+  const startLyricsDisplay = (startTimeSeconds) => {
+    // Clear any existing timer
+    if (lyricTimer) {
+      clearInterval(lyricTimer);
+      setLyricTimer(null);
+    }
+
+    // Calculate initial position
+    const initialIndex = findInitialLyricIndex(startTimeSeconds);
+    
+    // Create a reference point that won't change during playback
+    const initialTime = Date.now();
+    const initialOffset = startTimeSeconds;
+    
+    // Set initial states
+    setCurrentLyricIndex(initialIndex);
+    setCurrentTimecode(formatTimecode(startTimeSeconds));
+    
+    // Use a self-contained time reference that doesn't depend on state
+    const timer = setInterval(() => {
+      // Calculate elapsed time since timer started
+      const elapsed = (Date.now() - initialTime) / 1000;
+      
+      // Current position is the initial offset plus elapsed time
+      const currentTimeSeconds = initialOffset + elapsed;
+      
+      // Update the displayed timecode
+      setCurrentTimecode(formatTimecode(currentTimeSeconds));
+      
+      // Find the current lyric based on timestamp
+      setCurrentLyricIndex(prev => {
+        const nextIndex = findCurrentLyricIndex(currentTimeSeconds);
+        
+        // Only scroll if the index actually changed
+        if (nextIndex !== prev && nextIndex >= 0 && scrollViewRef.current) {
+          scrollViewRef.current.scrollTo({
+            y: nextIndex * 28, // Approximate height of each line
+            animated: true
+          });
+        }
+        
+        return nextIndex;
+      });
+    }, 250);
+    
+    setLyricTimer(timer);
+    
+    // Cleanup function
+    return () => {
+      if (timer) {
+        clearInterval(timer);
+      }
+    };
+  };
+
+  // Format seconds into timecode (MM:SS format)
+  const formatTimecode = (seconds) => {
+    if (!seconds && seconds !== 0) return '--:--';
+    
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = Math.floor(seconds % 60);
+    
+    return `${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`;
+  };
+
+  // Find the initial lyric index based on timecode
+  const findInitialLyricIndex = (startTimeSeconds) => {
+    if (!lyrics || lyrics.length === 0) return -1;
+    
+    // Find the lyric that should be displayed at this time
+    for (let i = 0; i < lyrics.length; i++) {
+      const timestamp = lyrics[i].timestamp;
+      if (!timestamp) continue;
+      
+      const lyricTimeSeconds = timeToSeconds(timestamp);
+      if (lyricTimeSeconds > startTimeSeconds) {
+        return Math.max(0, i - 1);
+      }
+    }
+    
+    return 0; // Default to first lyric if none found
+  };
+
+  // Update the findCurrentLyricIndex function to make transitions smoother
+  const findCurrentLyricIndex = (currentTimeSeconds) => {
+    if (!lyrics || lyrics.length === 0) return -1;
+    
+    let currentIndex = 0;
+    
+    // Find the last lyric that should be displayed at this time
+    for (let i = 0; i < lyrics.length; i++) {
+      const timestamp = lyrics[i].timestamp;
+      if (!timestamp) continue;
+      
+      const lyricTimeSeconds = timeToSeconds(timestamp);
+      
+      // Only advance to the next lyric if we're at least 0.2 seconds past the timestamp
+      if (lyricTimeSeconds <= currentTimeSeconds) {
+        currentIndex = i;
+      } else {
+        break;
+      }
+    }
+    
+    return currentIndex;
+  };
+
+  // Update the renderLyrics function to highlight the current lyric
   const renderLyrics = () => {
     if (!lyrics || lyrics.length === 0) return null;
 
@@ -187,24 +402,19 @@ export default function App() {
           style={styles.lyricsContainer}
           contentContainerStyle={styles.lyricsContent}
         >
-          {lyrics.map((line, index) => {
-            // Determine if this is a heading or metadata line
-            const isHeading = line.words.includes(':') && line.words.split(':')[0].length < 20;
-            const isMetadataHeading = line.words === "Lyrics metadata:";
-            
-            return (
-              <Text 
-                key={index} 
-                style={[
-                  styles.lyricLine,
-                  isHeading ? styles.metadataLine : null,
-                  isMetadataHeading ? styles.metadataHeading : null
-                ]}
-              >
-                {line.words}
-              </Text>
-            );
-          })}
+          {lyrics.map((line, index) => (
+            <Text 
+              key={index} 
+              style={[
+                styles.lyricLine,
+                index < currentLyricIndex ? styles.pastLyric :
+                index === currentLyricIndex ? styles.currentLyric :
+                styles.futureLyric
+              ]}
+            >
+              {line.words}
+            </Text>
+          ))}
         </ScrollView>
       </View>
     );
@@ -240,11 +450,9 @@ export default function App() {
             🎵 {song.title} {song.artist ? `- ${song.artist}` : ''}
           </Text>
           
-          {song.timecode && (
-            <Text style={styles.timeText}>
-              Position in track: {song.timecode}
-            </Text>
-          )}
+          <Text style={styles.timeText}>
+            Position in track: {currentTimecode || song.timecode || '--:--'}
+          </Text>
           
           {isDisplayingLyrics ? (
             renderLyrics()
@@ -343,5 +551,26 @@ const styles = StyleSheet.create({
     color: '#333',
     marginBottom: 8,
     textAlign: 'center',
+  },
+  timestamp: {
+    color: '#888',
+    fontSize: 14,
+    marginRight: 5,
+  },
+  pastLyric: {
+    color: '#888',
+    fontSize: 14,
+    opacity: 0.7,
+  },
+  currentLyric: {
+    color: '#000',
+    fontSize: 18,
+    fontWeight: 'bold',
+    opacity: 1,
+  },
+  futureLyric: {
+    color: '#aaa',
+    fontSize: 14,
+    opacity: 0.5,
   },
 });
