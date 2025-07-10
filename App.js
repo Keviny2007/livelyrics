@@ -392,7 +392,7 @@ export default function App() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>🎶 Lyrical Glasses</Text>
+      <Text style={styles.title}>livelyrics</Text>
       
       {/* Status and control section */}
       {isListening ? (
